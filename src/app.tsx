@@ -5,10 +5,23 @@ import { getToolName, isToolUIPart, type UIMessage } from "ai";
 import type { JarvisAgent } from "./server";
 import type { JarvisState, Memory } from "./memory";
 import { MemoryPanel, type BriefingSchedule } from "./memory-panel";
-import { MicButton, type MicMode } from "./mic-button";
-import { browserRecognitionSupported, isServerVoiceFailure } from "./voice";
+import { MicButton } from "./mic-button";
+import { useVoiceCapture, type MicMode } from "./use-voice-capture";
+import { VoiceScreen, type PendingApproval } from "./voice-screen";
+import type { AvatarMood } from "./avatar/avatar-view";
+import {
+  DEFAULT_CHARACTER,
+  characterById,
+  type CharacterId
+} from "./avatar/characters";
+import {
+  browserRecognitionSupported,
+  isServerVoiceFailure,
+  micLevel
+} from "./voice";
 import {
   playMp3,
+  speechLevel,
   speakWithBrowser,
   stopSpeaking,
   unlockAudio
@@ -45,6 +58,7 @@ import {
   CaretDownIcon,
   BugIcon,
   WarningIcon,
+  WaveformIcon,
   PlugsConnectedIcon,
   XIcon
 } from "@phosphor-icons/react";
@@ -268,25 +282,56 @@ const SUGGESTIONS = [
 ];
 
 /** Shown while Workers AI's free daily limit is used up. */
-function DailyLimitBanner({
-  limit
-}: {
-  limit: NonNullable<JarvisState["aiLimit"]>;
-}) {
+type DailyLimit = NonNullable<JarvisState["aiLimit"]>;
+
+function dailyLimitText(limit: DailyLimit): string {
   const resetsAt = new Date(limit.until).toLocaleTimeString(undefined, {
     hour: "2-digit",
     minute: "2-digit"
   });
+  return limit.fallbackModel
+    ? `Cloudflare Workers AI's free daily limit is used up. Jarvis is answering with a backup model (Ollama · ${limit.fallbackModel}) until it resets at ${resetsAt}.`
+    : `Cloudflare Workers AI's free daily limit is used up, so Jarvis can't reply until it resets at ${resetsAt}.`;
+}
+
+/** Shown while Workers AI's free daily limit is used up. */
+function DailyLimitBanner({ limit }: { limit: DailyLimit }) {
   return (
     <output className="flex items-start gap-2 px-4 sm:px-5 py-2.5 bg-kumo-warning/10 border-b border-kumo-line">
       <WarningIcon size={16} className="mt-0.5 shrink-0 text-kumo-warning" />
-      <Text size="sm">
-        {limit.fallbackModel
-          ? `Cloudflare Workers AI's free daily limit is used up. Jarvis is answering with a backup model (Ollama · ${limit.fallbackModel}) until it resets at ${resetsAt}.`
-          : `Cloudflare Workers AI's free daily limit is used up, so Jarvis can't reply until it resets at ${resetsAt}.`}
-      </Text>
+      <Text size="sm">{dailyLimitText(limit)}</Text>
     </output>
   );
+}
+
+const UI_MODE_KEY = "jarvis-mode";
+const CHARACTER_KEY = "jarvis-character";
+
+function readSetting(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function saveSetting(key: string, value: string) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // Not saved; the choice still applies for this visit
+  }
+}
+
+/** A tool call, in words, for the voice screen's approval card. */
+function describeTool(name: string): string {
+  if (name === "forget_fact") return "forget something about you";
+  if (name === "cancel_reminder") return "cancel a reminder";
+  const api = /^api_([a-z0-9]+)_(.+)$/.exec(name);
+  if (api) return `call ${api[2]} (${api[1]} API)`;
+  const mcp = /^tool_[^_]+_(.+)$/.exec(name);
+  if (mcp) return `use ${mcp[1]}`;
+  return `run ${name}`;
 }
 
 const SPEAK_REPLIES_KEY = "jarvis-speak-replies";
@@ -314,6 +359,21 @@ function Chat() {
   const [input, setInput] = useState("");
   const [showDebug, setShowDebug] = useState(false);
   const [showMemory, setShowMemory] = useState(false);
+  // Voice is the main screen; chat is the classic view of the same history
+  const [uiMode, setUiMode] = useState<"voice" | "chat">(() =>
+    readSetting(UI_MODE_KEY) === "chat" ? "chat" : "voice"
+  );
+  const [character, setCharacter] = useState<CharacterId>(
+    () => characterById(readSetting(CHARACTER_KEY) ?? DEFAULT_CHARACTER).id
+  );
+  const [awake, setAwake] = useState(false);
+  const [waveKey, setWaveKey] = useState(0);
+  const [greeting, setGreeting] = useState(false);
+  // Jarvis's caption outside a chat turn: the hello, reminders, briefings
+  const [announcement, setAnnouncement] = useState<string | null>(null);
+  // Set further down, once speech and the voice-mode state exist
+  const announceRef = useRef<(text: string) => void>(() => {});
+  const [sad, setSad] = useState(false);
   const [memory, setMemory] = useState<Memory | null>(null);
   // Bumped whenever the agent says memory changed; triggers a refetch
   const [memoryVersion, setMemoryVersion] = useState(0);
@@ -357,6 +417,7 @@ function Chat() {
           if (data.type === "reminder") {
             toasts.add({ title: "Reminder", description: data.text });
             notify("Jarvis reminder", data.text);
+            announceRef.current(`Master, here's your reminder: ${data.text}.`);
           }
           if (data.type === "integrations-changed") {
             setIntegrationsVersion((v) => v + 1);
@@ -418,15 +479,19 @@ function Chat() {
 
   // Notify when a new briefing lands (createdAt changes), not on first load
   const lastBriefingAt = agentState?.lastBriefing?.createdAt;
+  const lastBriefingText = agentState?.lastBriefing?.text;
   const seenBriefingAt = useRef<string | undefined>(undefined);
   useEffect(() => {
     if (!lastBriefingAt) return;
     if (seenBriefingAt.current && seenBriefingAt.current !== lastBriefingAt) {
       toasts.add({ title: "Your morning briefing is ready" });
       notify("Jarvis", "Your morning briefing is ready");
+      announceRef.current(
+        `Master, your morning briefing is ready. ${lastBriefingText ?? ""}`
+      );
     }
     seenBriefingAt.current = lastBriefingAt;
-  }, [lastBriefingAt, toasts]);
+  }, [lastBriefingAt, lastBriefingText, toasts]);
 
   const closeIntegrations = useCallback(() => setShowIntegrations(false), []);
 
@@ -478,6 +543,7 @@ function Chat() {
       // Spoken messages get spoken replies; otherwise follow the toggle
       speakNext.current = speakReplies || fromVoice;
       stopSpeaking();
+      setAnnouncement(null);
       sendMessage({
         role: "user",
         parts: [{ type: "text", text: text.trim() }]
@@ -587,8 +653,11 @@ function Chat() {
     });
   }, []);
   const voiceError = useCallback(
-    (message: string) =>
-      toasts.add({ title: "Voice input", description: message }),
+    (message: string) => {
+      toasts.add({ title: "Voice input", description: message });
+      setSad(true); // the character looks worried for a moment
+      setTimeout(() => setSad(false), 2500);
+    },
     [toasts]
   );
 
@@ -610,6 +679,202 @@ function Chat() {
     (dailyLimit && voiceSetup && !voiceSetup.groq)
       ? "browser"
       : "server";
+
+  // ── Voice mode ───────────────────────────────────────────────────────
+  // Voice mode sends what you said straight away; chat mode puts it in the box
+  const uiModeRef = useRef(uiMode);
+  uiModeRef.current = uiMode;
+  const handleTranscript = useCallback(
+    (text: string) => {
+      if (uiModeRef.current === "voice") sendText(text, true);
+      else insertTranscript(text);
+    },
+    [sendText, insertTranscript]
+  );
+  const capture = useVoiceCapture({
+    mode: micMode,
+    transcribe,
+    onTranscript: handleTranscript,
+    onError: voiceError,
+    onStart: startListening
+  });
+
+  // Hold Ctrl+Space to talk; let go to send
+  const captureRef = useRef(capture);
+  captureRef.current = capture;
+  const canTalkRef = useRef(false);
+  canTalkRef.current = connected && !isStreaming;
+  useEffect(() => {
+    const onDown = (e: KeyboardEvent) => {
+      if (e.code !== "Space" || !e.ctrlKey) return;
+      e.preventDefault();
+      if (e.repeat || !canTalkRef.current || !captureRef.current.supported) {
+        return;
+      }
+      setAwake(true);
+      void captureRef.current.start();
+    };
+    const onUp = (e: KeyboardEvent) => {
+      if (e.code !== "Space" && e.key !== "Control") return;
+      const { status } = captureRef.current;
+      if (status === "recording" || status === "starting") {
+        e.preventDefault();
+        void captureRef.current.finish();
+      }
+    };
+    window.addEventListener("keydown", onDown);
+    window.addEventListener("keyup", onUp);
+    return () => {
+      window.removeEventListener("keydown", onDown);
+      window.removeEventListener("keyup", onUp);
+    };
+  }, []);
+
+  // Waking the voice screen: a wave and a spoken hello (also unlocks audio)
+  const wake = useCallback(() => {
+    unlockAudio();
+    setAwake(true);
+    const line =
+      messages.length > 0
+        ? "Hey Master, welcome back. How you doing?"
+        : "Hey Master! I'm Jarvis. How you doing?";
+    setAnnouncement(line);
+    setGreeting(true);
+    setWaveKey((k) => k + 1);
+    setTimeout(() => setGreeting(false), 900);
+    setTimeout(() => void speakReply(line), 500);
+  }, [messages.length, speakReply]);
+
+  const switchMode = useCallback((mode: "voice" | "chat") => {
+    setUiMode(mode);
+    saveSetting(UI_MODE_KEY, mode);
+  }, []);
+
+  // Reminders and briefings are announced: a wave, a caption, and speech
+  // (always on the voice screen once awake; in chat if spoken replies are on)
+  announceRef.current = (text: string) => {
+    setAnnouncement(text);
+    setWaveKey((k) => k + 1);
+    const voiceMode = uiMode === "voice";
+    if ((voiceMode && awake) || (!voiceMode && speakReplies)) {
+      void speakReply(text);
+    }
+  };
+
+  const chooseCharacter = useCallback((id: CharacterId) => {
+    setCharacter(id);
+    saveSetting(CHARACTER_KEY, id);
+    setWaveKey((k) => k + 1);
+  }, []);
+
+  const mood: AvatarMood = sad
+    ? "sad"
+    : capture.status === "recording" || capture.status === "starting"
+      ? "listening"
+      : greeting
+        ? "happy"
+        : speaking
+          ? "speaking"
+          : capture.status === "transcribing" || isStreaming
+            ? "thinking"
+            : "idle";
+
+  // A tool call waiting for the user's approval, shown as a card by voice
+  const pendingApproval: PendingApproval | null = (() => {
+    const last = messages[messages.length - 1];
+    if (last?.role !== "assistant") return null;
+    for (const part of last.parts) {
+      if (
+        isToolUIPart(part) &&
+        part.state === "approval-requested" &&
+        "approval" in part
+      ) {
+        const approvalId = (part.approval as { id?: string })?.id;
+        if (!approvalId) continue;
+        return {
+          approvalId,
+          label: describeTool(getToolName(part)),
+          detail: JSON.stringify(part.input ?? {}).slice(0, 120)
+        };
+      }
+    }
+    return null;
+  })();
+
+  const memoryPanel = (
+    <MemoryPanel
+      memory={memory}
+      state={agentState}
+      briefingSchedule={briefingSchedule}
+      onRemoveFact={(id) => callAgent((s) => s.removeFact(id))}
+      onToggleTask={(id, done) => callAgent((s) => s.toggleTask(id, done))}
+      onRemoveTask={(id) => callAgent((s) => s.removeTask(id))}
+      onRemoveNote={(id) => callAgent((s) => s.removeNote(id))}
+      onRunBriefing={() => callAgent((s) => s.runBriefingNow())}
+      onSetBriefingTime={(time) => callAgent((s) => s.setBriefingTime(time))}
+      onRemoveReminder={(id) => callAgent((s) => s.removeReminder(id))}
+      onDismissReminder={(id) => callAgent((s) => s.dismissReminder(id))}
+    />
+  );
+
+  const integrationsPanel = (
+    <IntegrationsPanel
+      open={showIntegrations}
+      onClose={closeIntegrations}
+      integrations={integrations}
+      onAddApi={(input) => agentRef.current.stub.addApi(input)}
+      onRemoveApi={(id) => agentRef.current.stub.removeApi(id)}
+      onAddMcp={(input) => agentRef.current.stub.addMcp(input)}
+      onRemoveMcp={(id) => agentRef.current.stub.removeMcp(id)}
+    />
+  );
+
+  if (uiMode === "voice") {
+    return (
+      <>
+        <VoiceScreen
+          connected={connected}
+          awake={awake}
+          onWake={wake}
+          character={character}
+          onCharacterChange={chooseCharacter}
+          mood={mood}
+          waveKey={waveKey}
+          speechLevel={speechLevel}
+          micLevel={micLevel}
+          capture={capture}
+          speaking={speaking}
+          onStopSpeaking={() => {
+            stopSpeaking();
+            setSpeaking(false);
+          }}
+          messages={messages}
+          announcement={announcement}
+          isStreaming={isStreaming}
+          pendingApproval={pendingApproval}
+          onApproval={(approved) => {
+            if (!pendingApproval) return;
+            speakNext.current = true; // speak the reply that follows
+            addToolApprovalResponse({
+              id: pendingApproval.approvalId,
+              approved
+            });
+          }}
+          banner={
+            dailyLimit ? (
+              <p className="mx-auto w-fit max-w-[92%] rounded-xl bg-amber-400/15 px-4 py-2 text-center text-xs text-amber-100 ring-1 ring-amber-300/30 backdrop-blur">
+                {dailyLimitText(dailyLimit)}
+              </p>
+            ) : null
+          }
+          memoryPanel={memoryPanel}
+          onSwitchToChat={() => switchMode("chat")}
+          onOpenIntegrations={() => setShowIntegrations(true)}
+        />
+        {integrationsPanel}
+      </>
+    );
+  }
 
   return (
     <div className="flex flex-col h-screen bg-kumo-elevated">
@@ -645,6 +910,14 @@ function Chat() {
                 aria-label="Toggle debug mode"
               />
             </div>
+            <Button
+              variant="secondary"
+              icon={<WaveformIcon size={16} />}
+              onClick={() => switchMode("voice")}
+              aria-label="Switch to voice mode"
+            >
+              <span className="hidden sm:inline">Voice</span>
+            </Button>
             {speaking ? (
               <Button
                 variant="secondary"
@@ -860,7 +1133,7 @@ function Chat() {
             >
               <div className="flex items-end gap-3 rounded-xl border border-kumo-line bg-kumo-base p-3 shadow-sm focus-within:ring-2 focus-within:ring-kumo-ring focus-within:border-transparent transition-shadow">
                 <MicButton
-                  mode={micMode}
+                  capture={capture}
                   disabledReason={
                     !connected
                       ? "Not connected"
@@ -868,10 +1141,6 @@ function Chat() {
                         ? "Wait for Jarvis to finish replying"
                         : null
                   }
-                  transcribe={transcribe}
-                  onTranscript={insertTranscript}
-                  onError={voiceError}
-                  onStart={startListening}
                 />
                 <InputArea
                   ref={textareaRef}
@@ -939,35 +1208,11 @@ function Chat() {
               onClick={() => setShowMemory(false)}
             />
           </div>
-          <MemoryPanel
-            memory={memory}
-            state={agentState}
-            briefingSchedule={briefingSchedule}
-            onRemoveFact={(id) => callAgent((s) => s.removeFact(id))}
-            onToggleTask={(id, done) =>
-              callAgent((s) => s.toggleTask(id, done))
-            }
-            onRemoveTask={(id) => callAgent((s) => s.removeTask(id))}
-            onRemoveNote={(id) => callAgent((s) => s.removeNote(id))}
-            onRunBriefing={() => callAgent((s) => s.runBriefingNow())}
-            onSetBriefingTime={(time) =>
-              callAgent((s) => s.setBriefingTime(time))
-            }
-            onRemoveReminder={(id) => callAgent((s) => s.removeReminder(id))}
-            onDismissReminder={(id) => callAgent((s) => s.dismissReminder(id))}
-          />
+          {memoryPanel}
         </aside>
       </div>
 
-      <IntegrationsPanel
-        open={showIntegrations}
-        onClose={closeIntegrations}
-        integrations={integrations}
-        onAddApi={(input) => agentRef.current.stub.addApi(input)}
-        onRemoveApi={(id) => agentRef.current.stub.removeApi(id)}
-        onAddMcp={(input) => agentRef.current.stub.addMcp(input)}
-        onRemoveMcp={(id) => agentRef.current.stub.removeMcp(id)}
-      />
+      {integrationsPanel}
     </div>
   );
 }

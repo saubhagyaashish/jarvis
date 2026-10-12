@@ -2,7 +2,17 @@
 // WAV (Whisper's native rate, and a format every decoder accepts), and
 // base64-encode it for the agent's `transcribe` method.
 
+import { audioContext, levelMeter } from "./audio-levels";
+
 export const MAX_RECORDING_MS = 30_000;
+
+// Loudness of the mic while recording (drives the avatar's listening glow)
+let micMeter: (() => number) | null = null;
+
+/** How loud the user is speaking right now (0..1); 0 when not recording. */
+export function micLevel(): number {
+  return micMeter ? micMeter() : 0;
+}
 const WHISPER_SAMPLE_RATE = 16_000;
 
 export function voiceSupported(): boolean {
@@ -33,6 +43,9 @@ export async function startRecording(
 ): Promise<Recording> {
   const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
   const recorder = new MediaRecorder(stream);
+  const ctx = audioContext();
+  // Measure only: the mic is not connected to the speakers
+  micMeter = ctx ? levelMeter(ctx.createMediaStreamSource(stream)) : null;
   const chunks: Blob[] = [];
   recorder.addEventListener("dataavailable", (e) => {
     if (e.data.size > 0) chunks.push(e.data);
@@ -40,6 +53,7 @@ export async function startRecording(
 
   const stopped = new Promise<Blob>((resolve) => {
     recorder.addEventListener("stop", () => {
+      micMeter = null;
       for (const track of stream.getTracks()) track.stop();
       resolve(new Blob(chunks, { type: recorder.mimeType }));
     });
