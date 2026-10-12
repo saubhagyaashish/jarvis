@@ -1,15 +1,44 @@
+// Adapters between workers-ai-provider and Workers AI's Llama 3.3 output.
+
 /**
- * Workers AI streams Llama 3.3 chunks in two formats at once: the native
- * `response` / `tool_calls` fields and the OpenAI-style `choices[0].delta`.
- * workers-ai-provider (3.3.1) reads both, so every token and every tool-call
- * argument arrives twice — doubled text, and tool arguments that fail to parse.
+ * The result of a non-streaming `AI.run()`, in either format: the native
+ * `response` field or OpenAI-style `choices[0].message.content`. In JSON
+ * mode this may already be a parsed object.
+ */
+export function readAiOutput(output: unknown): unknown {
+  const o = output as {
+    response?: unknown;
+    choices?: { message?: { content?: unknown } }[];
+  } | null;
+  return o?.response ?? o?.choices?.[0]?.message?.content;
+}
+
+/** The text of a non-streaming `AI.run()` result ("" if there is none). */
+export function readAiText(output: unknown): string {
+  const value = readAiOutput(output);
+  return typeof value === "string" ? value : "";
+}
+
+/**
+ * Wraps the AI binding to smooth over two Workers AI quirks:
  *
- * This wraps the AI binding and drops the native fields from any streamed
- * chunk that also carries `choices[0].delta`, so the provider sees each delta
- * once. Remove it once workers-ai-provider handles dual-format chunks.
+ * 1. Llama 3.3 streams each chunk in two formats at once: the native
+ *    `response` / `tool_calls` fields and OpenAI-style `choices[0].delta`.
+ *    workers-ai-provider (3.3.1) reads both, so every token and tool-call
+ *    argument arrives twice. The wrapper drops the native fields from any
+ *    chunk that also carries `choices[0].delta`.
+ * 2. Workers AI rejects `tools: []` ("omit the field entirely"), which the
+ *    provider sends when a step disables all tools. The wrapper omits it.
+ *
+ * Remove once workers-ai-provider handles both.
  */
 export function withSingleFormatStream(ai: Ai): Ai {
   const run = async (...args: unknown[]) => {
+    const inputs = args[1] as Record<string, unknown> | undefined;
+    if (Array.isArray(inputs?.tools) && inputs.tools.length === 0) {
+      const { tools: _tools, tool_choice: _toolChoice, ...rest } = inputs;
+      args = [args[0], rest, ...args.slice(2)];
+    }
     const result: unknown = await (
       ai.run as (...a: unknown[]) => Promise<unknown>
     )(...args);

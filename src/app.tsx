@@ -3,8 +3,8 @@ import { useAgent } from "agents/react";
 import { useAgentChat } from "@cloudflare/ai-chat/react";
 import { getToolName, isToolUIPart, type UIMessage } from "ai";
 import type { JarvisAgent } from "./server";
-import type { Memory } from "./memory";
-import { MemoryPanel } from "./memory-panel";
+import type { JarvisState, Memory } from "./memory";
+import { MemoryPanel, type BriefingSchedule } from "./memory-panel";
 import {
   Badge,
   Button,
@@ -32,6 +32,7 @@ import {
   BrainIcon,
   CaretDownIcon,
   BugIcon,
+  WarningIcon,
   XIcon
 } from "@phosphor-icons/react";
 
@@ -248,9 +249,38 @@ const instanceId = getInstanceId();
 const SUGGESTIONS = [
   "I'm vegetarian and I live in Bengaluru",
   "Add a task to call Raj tomorrow at 3pm",
-  "Save a note: book ideas are Atomic Habits and Deep Work",
+  "Remind me in 2 minutes to stretch",
+  "Brief me every morning at 8",
   "What do you remember about me?"
 ];
+
+/** Shown while Workers AI's free daily limit is used up. */
+function DailyLimitBanner({
+  limit
+}: {
+  limit: NonNullable<JarvisState["aiLimit"]>;
+}) {
+  const resetsAt = new Date(limit.until).toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+  return (
+    <output className="flex items-start gap-2 px-4 sm:px-5 py-2.5 bg-kumo-warning/10 border-b border-kumo-line">
+      <WarningIcon size={16} className="mt-0.5 shrink-0 text-kumo-warning" />
+      <Text size="sm">
+        {limit.fallbackModel
+          ? `Cloudflare Workers AI's free daily limit is used up. Jarvis is answering with a backup model (Ollama · ${limit.fallbackModel}) until it resets at ${resetsAt}.`
+          : `Cloudflare Workers AI's free daily limit is used up, so Jarvis can't reply until it resets at ${resetsAt}.`}
+      </Text>
+    </output>
+  );
+}
+
+function notify(title: string, body: string) {
+  if ("Notification" in window && Notification.permission === "granted") {
+    new Notification(title, { body });
+  }
+}
 
 // ── Main chat ─────────────────────────────────────────────────────────
 
@@ -262,11 +292,15 @@ function Chat() {
   const [memory, setMemory] = useState<Memory | null>(null);
   // Bumped whenever the agent says memory changed; triggers a refetch
   const [memoryVersion, setMemoryVersion] = useState(0);
+  // Synced agent state: briefing status, latest briefing, fired reminders
+  const [agentState, setAgentState] = useState<JarvisState | null>(null);
+  const [briefingSchedule, setBriefingSchedule] =
+    useState<BriefingSchedule | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const toasts = useKumoToastManager();
 
-  const agent = useAgent<JarvisAgent>({
+  const agent = useAgent<JarvisAgent, JarvisState>({
     agent: "JarvisAgent",
     name: instanceId,
     onOpen: useCallback(() => setConnected(true), []),
@@ -275,10 +309,18 @@ function Chat() {
       (error: Event) => console.error("WebSocket error:", error),
       []
     ),
+    onStateUpdate: useCallback(
+      (state: JarvisState) => setAgentState(state),
+      []
+    ),
     onMessage: useCallback(
       (message: MessageEvent) => {
         try {
           const data = JSON.parse(String(message.data));
+          if (data.type === "reminder") {
+            toasts.add({ title: "Reminder", description: data.text });
+            notify("Jarvis reminder", data.text);
+          }
           if (data.type === "memory-changed") {
             setMemoryVersion((v) => v + 1);
             if (Array.isArray(data.added) && data.added.length > 0) {
@@ -316,6 +358,27 @@ function Chat() {
       .then(setMemory)
       .catch((e: unknown) => console.error("Failed to load memory:", e));
   }, [connected, memoryVersion]);
+
+  const briefingScheduleId = agentState?.briefingScheduleId;
+  useEffect(() => {
+    if (!connected) return;
+    agentRef.current.stub
+      .getBriefingSchedule()
+      .then(setBriefingSchedule)
+      .catch((e: unknown) => console.error("Failed to load briefing:", e));
+  }, [connected, briefingScheduleId]);
+
+  // Notify when a new briefing lands (createdAt changes), not on first load
+  const lastBriefingAt = agentState?.lastBriefing?.createdAt;
+  const seenBriefingAt = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (!lastBriefingAt) return;
+    if (seenBriefingAt.current && seenBriefingAt.current !== lastBriefingAt) {
+      toasts.add({ title: "Your morning briefing is ready" });
+      notify("Jarvis", "Your morning briefing is ready");
+    }
+    seenBriefingAt.current = lastBriefingAt;
+  }, [lastBriefingAt, toasts]);
 
   const callAgent = useCallback(
     (action: (stub: typeof agent.stub) => Promise<unknown>) => {
@@ -370,6 +433,9 @@ function Chat() {
   }, [input, isStreaming, sendText]);
 
   const factCount = memory?.facts.length ?? 0;
+  const limit = agentState?.aiLimit;
+  const dailyLimit =
+    limit && Date.parse(limit.until) > Date.now() ? limit : null;
 
   return (
     <div className="flex flex-col h-screen bg-kumo-elevated">
@@ -426,6 +492,8 @@ function Chat() {
           </div>
         </div>
       </header>
+
+      {dailyLimit && <DailyLimitBanner limit={dailyLimit} />}
 
       <div className="relative flex flex-1 min-h-0">
         {/* Chat column */}
@@ -626,25 +694,33 @@ function Chat() {
         >
           <div className="flex items-center justify-between px-5 pt-4 md:hidden">
             <Text size="sm" bold>
-              Memory
+              Jarvis
             </Text>
             <Button
               variant="ghost"
               size="sm"
               shape="square"
-              aria-label="Close memory"
+              aria-label="Close panel"
               icon={<XIcon size={14} />}
               onClick={() => setShowMemory(false)}
             />
           </div>
           <MemoryPanel
             memory={memory}
+            state={agentState}
+            briefingSchedule={briefingSchedule}
             onRemoveFact={(id) => callAgent((s) => s.removeFact(id))}
             onToggleTask={(id, done) =>
               callAgent((s) => s.toggleTask(id, done))
             }
             onRemoveTask={(id) => callAgent((s) => s.removeTask(id))}
             onRemoveNote={(id) => callAgent((s) => s.removeNote(id))}
+            onRunBriefing={() => callAgent((s) => s.runBriefingNow())}
+            onSetBriefingTime={(time) =>
+              callAgent((s) => s.setBriefingTime(time))
+            }
+            onRemoveReminder={(id) => callAgent((s) => s.removeReminder(id))}
+            onDismissReminder={(id) => callAgent((s) => s.dismissReminder(id))}
           />
         </aside>
       </div>

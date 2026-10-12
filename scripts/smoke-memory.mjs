@@ -8,173 +8,15 @@
 //
 // Usage: node scripts/smoke-memory.mjs [baseUrl]
 
+import { agentClient, checker, sleep } from "./agent-test-client.mjs";
+
 const baseUrl = process.argv[2] ?? "http://localhost:5173";
-const instance = `smoke-mem-${crypto.randomUUID()}`;
-const wsUrl = `${baseUrl.replace(/^http/, "ws")}/agents/jarvis-agent/${instance}`;
-const results = [];
-
-function check(name, ok, detail = "") {
-  results.push({ name, ok });
-  console.log(
-    `${ok ? "PASS" : "FAIL"}  ${name}${detail ? ` — ${detail}` : ""}`
-  );
-}
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-/** One WebSocket connection to the agent instance. */
-class Connection {
-  constructor() {
-    this.ws = new WebSocket(wsUrl);
-    this.history = null; // full chat history the server syncs on connect
-    this.listeners = new Set();
-    this.ws.addEventListener("message", (event) => {
-      let data;
-      try {
-        data = JSON.parse(String(event.data));
-      } catch {
-        return;
-      }
-      if (data.type === "cf_agent_chat_messages") this.history = data.messages;
-      for (const listener of this.listeners) listener(data);
-    });
-  }
-
-  async open() {
-    await new Promise((resolve, reject) => {
-      this.ws.addEventListener("open", resolve, { once: true });
-      this.ws.addEventListener(
-        "error",
-        () => reject(new Error(`cannot connect to ${wsUrl}`)),
-        {
-          once: true
-        }
-      );
-    });
-    // Give the server a moment to sync the existing history
-    for (let i = 0; i < 20 && this.history === null; i++) await sleep(100);
-    this.history ??= [];
-    return this;
-  }
-
-  send(message) {
-    this.ws.send(JSON.stringify(message));
-  }
-
-  rpc(method, ...args) {
-    const id = crypto.randomUUID();
-    return this.waitFor(
-      (data) => {
-        if (data.type !== "rpc" || data.id !== id) return undefined;
-        if (!data.success) throw new Error(`rpc ${method}: ${data.error}`);
-        return data.result;
-      },
-      () => this.send({ type: "rpc", id, method, args })
-    );
-  }
-
-  /** Collect one streamed turn (any request id) until it reports done. */
-  collectTurn(requestId) {
-    const turn = { reply: "", tools: [], approvals: [] };
-    return this.waitFor(
-      (data) => {
-        if (data.type !== "cf_agent_use_chat_response") return undefined;
-        if (requestId && data.id !== requestId) return undefined;
-        if (data.error) throw new Error(`agent error: ${data.body}`);
-        if (data.body) {
-          const chunk = JSON.parse(data.body);
-          if (chunk.type === "text-delta") turn.reply += chunk.delta;
-          if (chunk.type === "tool-input-available") {
-            turn.tools.push({
-              name: chunk.toolName,
-              input: chunk.input,
-              id: chunk.toolCallId
-            });
-          }
-          if (chunk.type === "tool-approval-request")
-            turn.approvals.push(chunk.toolCallId);
-        }
-        return data.done ? turn : undefined;
-      },
-      () => {},
-      90_000
-    );
-  }
-
-  async chat(text) {
-    const requestId = crypto.randomUUID();
-    const message = {
-      id: crypto.randomUUID(),
-      role: "user",
-      parts: [{ type: "text", text }]
-    };
-    const turn = this.collectTurn(requestId);
-    this.send({
-      id: requestId,
-      type: "cf_agent_use_chat_request",
-      init: {
-        method: "POST",
-        body: JSON.stringify({
-          messages: [...this.history, message],
-          trigger: "submit-message"
-        })
-      }
-    });
-    const result = await turn;
-    console.log(`  > ${text}`);
-    for (const t of result.tools)
-      console.log(`    tool: ${t.name}(${JSON.stringify(t.input)})`);
-    console.log(`  < ${result.reply.trim() || "(no text)"}`);
-    return result;
-  }
-
-  waitFor(match, start, timeoutMs = 30_000) {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.listeners.delete(listener);
-        reject(new Error("timed out"));
-      }, timeoutMs);
-      const listener = (data) => {
-        try {
-          const value = match(data);
-          if (value === undefined) return;
-          clearTimeout(timer);
-          this.listeners.delete(listener);
-          resolve(value);
-        } catch (error) {
-          clearTimeout(timer);
-          this.listeners.delete(listener);
-          reject(error);
-        }
-      };
-      this.listeners.add(listener);
-      start();
-    });
-  }
-
-  close() {
-    this.ws.close();
-  }
-}
-
-/** Each chat turn on a fresh connection, so it starts from the server's saved history. */
-async function chat(text) {
-  const conn = await new Connection().open();
-  try {
-    return await conn.chat(text);
-  } finally {
-    conn.close();
-  }
-}
-
-async function memory() {
-  const conn = await new Connection().open();
-  try {
-    return await conn.rpc("getMemory");
-  } finally {
-    conn.close();
-  }
-}
+const { wsUrl, Connection, chat, rpc } = agentClient(
+  baseUrl,
+  `smoke-mem-${crypto.randomUUID()}`
+);
+const { check, finish } = checker();
+const memory = () => rpc("getMemory");
 
 /** Fact extraction runs in the background after the reply; poll for it. */
 async function waitForFacts(atLeast, timeoutMs = 30_000) {
@@ -294,8 +136,4 @@ check(
   "expects vegetarian + Priya"
 );
 
-const failed = results.filter((r) => !r.ok);
-console.log(
-  `\n${results.length - failed.length}/${results.length} checks passed`
-);
-process.exit(failed.length > 0 ? 1 : 0);
+finish();

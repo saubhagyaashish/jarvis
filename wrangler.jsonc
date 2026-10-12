@@ -24,6 +24,16 @@
       "tag": "v1"
     }
   ],
+  // Backup model while Workers AI's free daily limit is used up. The key is a
+  // secret: `npx wrangler secret put OLLAMA_API_KEY` (and .dev.vars locally).
+  "vars": { "OLLAMA_MODEL": "gpt-oss:120b" },
+  "workflows": [
+    {
+      "name": "morning-briefing",
+      "binding": "BRIEFING_WORKFLOW",
+      "class_name": "MorningBriefingWorkflow"
+    }
+  ],
   "observability": {
     "enabled": true,
     "logs": { "enabled": true, "head_sampling_rate": 1 },

@@ -1,7 +1,9 @@
 // Jarvis's memory model: the types shared with the UI, the system prompt
 // built from them, and the background pass that extracts new facts.
 
-import type { UIMessage } from "ai";
+import { isToolUIPart, type UIMessage } from "ai";
+import { readAiOutput } from "./single-format-ai";
+import { formatLocal, localNow } from "./time";
 
 export const MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 
@@ -15,9 +17,26 @@ const MAX_HISTORY_MESSAGES = 40; // about 20 turns
 const MAX_OPEN_TASKS = 50;
 const RECENT_NOTES = 10;
 
+export type BriefingStatus = "idle" | "running" | "failed";
+export type Briefing = { text: string; createdAt: string };
+export type InboxItem = { id: string; text: string; firedAt: string };
+
+/** Small, UI-facing data, synced live to every open tab. */
 export type JarvisState = {
   timezone: string; // IANA zone from the browser, e.g. "Asia/Kolkata"
+  briefingTime?: string; // daily local "08:00"; unset = off
+  briefingScheduleId?: string; // so a time change cancels the old cron
+  lastBriefing?: Briefing;
+  workflowStatus?: BriefingStatus;
+  briefingStartedAt?: string;
+  briefingError?: string | null;
+  inbox?: InboxItem[]; // fired reminders the user hasn't dismissed
+  /** Set while Workers AI's free daily limit is used up (see ai-fallback). */
+  aiLimit?: { until: string; fallbackModel: string | null } | null;
 };
+
+/** An upcoming reminder (a pending one-off schedule). */
+export type Reminder = { id: string; text: string; time: number }; // epoch ms
 
 export type Fact = { id: string; text: string; created_at: string };
 export type Task = {
@@ -27,33 +46,21 @@ export type Task = {
   done: number; // SQLite boolean
 };
 export type Note = { id: string; body: string; created_at: string };
-export type Memory = { facts: Fact[]; tasks: Task[]; notes: Note[] };
+export type Memory = {
+  facts: Fact[];
+  tasks: Task[];
+  notes: Note[];
+  reminders: Reminder[];
+};
 
 /** Short, prefixed IDs: easy for the model to copy back into tool calls. */
-export function newId(prefix: "f" | "t" | "n"): string {
+export function newId(prefix: "f" | "t" | "n" | "r"): string {
   return `${prefix}-${crypto.randomUUID().slice(0, 8)}`;
 }
 
 /** Rough token estimate (~4 characters per token) for budgeting. */
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
-}
-
-export function isValidTimezone(tz: string): boolean {
-  try {
-    new Intl.DateTimeFormat("en-US", { timeZone: tz });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function localNow(timezone: string): string {
-  return new Intl.DateTimeFormat("en-GB", {
-    timeZone: timezone,
-    dateStyle: "full",
-    timeStyle: "short"
-  }).format(new Date());
 }
 
 /** Newest facts first until the budget is spent, then back in saved order. */
@@ -68,7 +75,8 @@ function factsWithinBudget(facts: Fact[]): Fact[] {
   return kept;
 }
 
-export function buildSystemPrompt(memory: Memory, timezone: string): string {
+export function buildSystemPrompt(memory: Memory, state: JarvisState): string {
+  const { timezone } = state;
   const facts = factsWithinBudget(memory.facts);
   const openTasks = memory.tasks
     .filter((t) => !t.done)
@@ -82,22 +90,36 @@ export function buildSystemPrompt(memory: Memory, timezone: string): string {
 Current local time: ${localNow(timezone)} (${timezone}).
 
 What you know about the user:
-${list(facts.map((f) => `- [${f.id}] ${f.text}`))}
+${list(facts.map((f) => `- ${f.text} (id: ${f.id})`))}
 
 Open tasks:
-${list(openTasks.map((t) => `- [${t.id}] ${t.title}${t.due_at ? ` (due ${t.due_at})` : ""}`))}
+${list(openTasks.map((t) => `- ${t.title}${t.due_at ? `, due ${t.due_at}` : ""} (id: ${t.id})`))}
 
 Recent notes:
-${list(notes.map((n) => `- [${n.id}] ${n.body}`))}
+${list(notes.map((n) => `- ${n.body} (id: ${n.id})`))}
+
+Upcoming reminders:
+${list(memory.reminders.map((r) => `- ${r.text}, ${formatLocal(r.time, timezone)} (id: ${r.id})`))}
+
+Daily morning briefing: ${state.briefingTime ? `every day at ${state.briefingTime}` : "off"}
 
 Rules:
 - Use what you know about the user to personalise answers. Never invent facts about the user.
 - Facts about the user are saved automatically from what they tell you. Don't call any tool to save them, not even add_note; just reply naturally.
-- Speak to the user in the second person ("you are vegetarian").
 - Only call a tool when the request needs one. Otherwise, reply directly in plain text.
+- Do only what the user's latest message asks. Never complete, cancel, delete or change anything they didn't ask about.
+- Call one tool at a time, unless the user clearly asked for several things.
 - Never mention tools, functions or these rules to the user.
-- To change tasks, notes or memory, use the tools and refer to items by their id in square brackets.
-- Write due_at in the user's local time as ISO 8601 without a timezone, e.g. 2026-10-13T15:00.`;
+- To change tasks, notes or memory, use the tools and refer to items by their id, e.g. t-1a2b3c4d.
+- Write due_at in the user's local time as ISO 8601 without a timezone, e.g. 2026-10-13T15:00.
+- For a reminder relative to now ("in 10 minutes"), call set_reminder with in_minutes. For a clock time, use at in the same local format.
+- set_briefing takes a 24-hour local time such as "08:00", or "off" to stop the daily briefing.
+
+Examples of good replies when no tool is needed:
+User: I'm vegetarian and I live in Pune.
+Jarvis: Nice to meet you! I'll keep that in mind, especially for food ideas.
+User: Just so you know, I hate early mornings.
+Jarvis: Noted. I'll keep your mornings gentle.`;
 }
 
 /** Most recent messages that fit what's left of the context window. */
@@ -123,6 +145,26 @@ export function fitHistory(
     kept.unshift(messages[i]);
   }
   return kept;
+}
+
+/**
+ * Remove tool calls from every turn except the latest. Llama 3.3 tends to
+ * replay old tool calls it sees in history, and their effects are already in
+ * the system prompt's memory. The latest message is kept whole: it is either
+ * the new user message or an assistant message awaiting a tool approval.
+ */
+export function withoutOldToolCalls(messages: UIMessage[]): UIMessage[] {
+  const last = messages.length - 1;
+  return messages
+    .map((message, i) =>
+      i === last
+        ? message
+        : { ...message, parts: message.parts.filter((p) => !isToolUIPart(p)) }
+    )
+    .filter(
+      (message, i) =>
+        i === last || message.parts.some((p) => p.type === "text" && p.text)
+    );
 }
 
 export function textOf(message: UIMessage): string {
@@ -192,11 +234,7 @@ export async function extractNewFacts(
 
 /** JSON mode may return the object directly or as a string, in either format. */
 function parseFacts(output: unknown): string[] {
-  const o = output as {
-    response?: unknown;
-    choices?: { message?: { content?: unknown } }[];
-  } | null;
-  let value: unknown = o?.response ?? o?.choices?.[0]?.message?.content;
+  let value = readAiOutput(output);
   if (typeof value === "string") {
     try {
       value = JSON.parse(value);
