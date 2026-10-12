@@ -7,14 +7,21 @@ import {
 } from "@cloudflare/ai-chat";
 import {
   convertToModelMessages,
+  jsonSchema,
   stepCountIs,
   streamText,
   tool,
+  type ToolSet,
   type UIMessage
 } from "ai";
 import { z } from "zod";
 import { readAiText, withSingleFormatStream } from "./single-format-ai";
-import { nextDailyReset, withOllamaFallback } from "./ai-fallback";
+import {
+  fallbackModel,
+  isDailyLimitError,
+  nextDailyReset,
+  withOllamaFallback
+} from "./ai-fallback";
 import { dropToolTalk, isToolTalk, toPlainChat } from "./tool-talk-filter";
 import {
   MAX_OUTPUT_TOKENS,
@@ -42,6 +49,19 @@ import {
   localToUtc
 } from "./time";
 import type { BriefingContext } from "./briefing-workflow";
+import {
+  groqConfigured,
+  synthesizeWithAura,
+  transcribeWithGroq
+} from "./speech-server";
+import { toSpeechText } from "./speech-text";
+import {
+  callOperation,
+  convertSpec,
+  estimateTokens,
+  parseSpec,
+  type ApiTool
+} from "./openapi-tools";
 
 export { MorningBriefingWorkflow } from "./briefing-workflow";
 
@@ -49,6 +69,58 @@ const BRIEFING_TIME = /^([01]\d|2[0-3]):[0-5]\d$/;
 // A run still "running" after this long is assumed lost, so a new one may start
 const BRIEFING_STALE_MS = 5 * 60_000;
 const MAX_INBOX = 20;
+
+const WHISPER_MODEL = "@cf/openai/whisper-large-v3-turbo";
+// About 45 seconds of 16 kHz mono WAV, base64-encoded; the UI stops at 30 s
+const MAX_AUDIO_BASE64 = 2_000_000;
+const VOICE_UNAVAILABLE =
+  "Voice input is unavailable until the Workers AI daily limit resets.";
+
+// Connected APIs (from OpenAPI specs) and MCP servers. Llama 3.3 gets less
+// reliable with many tools, so only a limited number are offered.
+const MAX_API_SOURCES = 3;
+const MAX_MCP_SERVERS = 3;
+const MAX_TOOLS_PER_API = 10;
+const MAX_EXTERNAL_TOOLS = 15;
+const MAX_SPEC_CHARS = 1_000_000;
+const MAX_TOOL_RESULT_CHARS = 4_000;
+
+type ApiSourceRow = {
+  id: string;
+  name: string;
+  slug: string; // tool-name prefix: api_<slug>_<operation>
+  base_url: string;
+  spec: string;
+  spec_url: string | null;
+  auth_header: string | null;
+  auth_value: string | null; // never sent to the browser or the model
+  created_at: string;
+};
+type LoadedApi = { row: ApiSourceRow; tools: ApiTool[]; skipped: number };
+
+function requireHttps(url: string, label: string) {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`${label} isn't a valid URL.`);
+  }
+  if (parsed.protocol !== "https:") throw new Error(`${label} must use https.`);
+}
+
+/** MCP tool results → plain text, clipped so one result can't fill the context. */
+function clipToolResult(result: unknown): string {
+  const content = (result as { content?: { type: string; text?: string }[] })
+    ?.content;
+  const text = Array.isArray(content)
+    ? content
+        .map((c) => (c.type === "text" ? (c.text ?? "") : `[${c.type}]`))
+        .join("\n")
+    : JSON.stringify(result);
+  return text.length > MAX_TOOL_RESULT_CHARS
+    ? `${text.slice(0, MAX_TOOL_RESULT_CHARS)}…`
+    : text;
+}
 
 /** Llama sometimes copies an id with its brackets: "[t-1a2b]" → "t-1a2b". */
 function cleanId(id: string): string {
@@ -64,6 +136,10 @@ export class JarvisAgent extends AIChatAgent<Env, JarvisState> {
   initialState: JarvisState = { timezone: "UTC" };
   maxPersistedMessages = 100;
   chatRecovery = true;
+  // Reconnect saved MCP servers after hibernation before answering
+  waitForMcpConnections = true;
+  // Converted OpenAPI specs, kept while this instance is in memory
+  private apiCache = new Map<string, LoadedApi>();
 
   onStart() {
     this.sql`CREATE TABLE IF NOT EXISTS facts (
@@ -72,6 +148,23 @@ export class JarvisAgent extends AIChatAgent<Env, JarvisState> {
       id TEXT PRIMARY KEY, title TEXT NOT NULL, due_at TEXT, done INTEGER NOT NULL DEFAULT 0)`;
     this.sql`CREATE TABLE IF NOT EXISTS notes (
       id TEXT PRIMARY KEY, body TEXT NOT NULL, created_at TEXT NOT NULL)`;
+    this.sql`CREATE TABLE IF NOT EXISTS api_sources (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL,
+      base_url TEXT NOT NULL, spec TEXT NOT NULL, spec_url TEXT,
+      auth_header TEXT, auth_value TEXT, created_at TEXT NOT NULL)`;
+
+    // MCP servers that use OAuth finish sign-in in a popup; close it after
+    this.mcp.configureOAuthCallback({
+      customHandler: (result) =>
+        result.authSuccess
+          ? new Response("<script>window.close();</script>", {
+              headers: { "content-type": "text/html" }
+            })
+          : new Response(
+              `Authentication failed: ${result.authError || "unknown error"}`,
+              { status: 400, headers: { "content-type": "text/plain" } }
+            )
+    });
   }
 
   // ── Model access ─────────────────────────────────────────────────────
@@ -83,22 +176,110 @@ export class JarvisAgent extends AIChatAgent<Env, JarvisState> {
    */
   private ai(): Ai {
     return withOllamaFallback(this.env.AI, this.env, {
-      isLimited: () => {
-        const limit = this.state.aiLimit;
-        return Boolean(limit && Date.parse(limit.until) > Date.now());
-      },
-      onLimit: (fallbackModel) => {
-        const limit = this.state.aiLimit;
-        if (limit && Date.parse(limit.until) > Date.now()) return;
-        this.setState({
-          ...this.state,
-          aiLimit: { until: nextDailyReset(), fallbackModel }
-        });
-      },
+      isLimited: () => this.dailyLimitActive(),
+      onLimit: (fallbackModel) => this.recordDailyLimit(fallbackModel),
       onPrimaryOk: () => {
         if (this.state.aiLimit) this.setState({ ...this.state, aiLimit: null });
       }
     });
+  }
+
+  private dailyLimitActive(): boolean {
+    const limit = this.state.aiLimit;
+    return Boolean(limit && Date.parse(limit.until) > Date.now());
+  }
+
+  /** Remember the limit until the 00:00 UTC reset (drives the UI banner). */
+  private recordDailyLimit(fallbackModel: string | null) {
+    if (this.dailyLimitActive()) return;
+    this.setState({
+      ...this.state,
+      aiLimit: { until: nextDailyReset(), fallbackModel }
+    });
+  }
+
+  // ── Voice ────────────────────────────────────────────────────────────
+
+  /**
+   * Speech-to-text for the mic button. Calls Workers AI directly, without
+   * the Ollama fallback: Ollama has no speech-to-text model.
+   */
+  @callable()
+  async transcribe(audioBase64: string): Promise<string> {
+    if (typeof audioBase64 !== "string" || audioBase64.length === 0) {
+      throw new Error("No audio received.");
+    }
+    if (audioBase64.length > MAX_AUDIO_BASE64) {
+      throw new Error("That recording is too long. Keep it under 30 seconds.");
+    }
+    // Whisper on Workers AI first; Groq's Whisper while the daily limit is
+    // in effect (or if Workers AI fails). The browser has its own fallback.
+    const groq = groqConfigured(this.env);
+    if (this.dailyLimitActive()) {
+      if (!groq) throw new Error(VOICE_UNAVAILABLE);
+      return this.logTranscript(
+        "groq",
+        await transcribeWithGroq(this.env, audioBase64)
+      );
+    }
+    let output: { text?: string };
+    try {
+      output = await this.env.AI.run(WHISPER_MODEL, {
+        audio: audioBase64,
+        task: "transcribe",
+        vad_filter: true
+      });
+    } catch (error) {
+      if (isDailyLimitError(error))
+        this.recordDailyLimit(fallbackModel(this.env));
+      if (!groq) {
+        if (isDailyLimitError(error)) throw new Error(VOICE_UNAVAILABLE);
+        throw error;
+      }
+      return this.logTranscript(
+        "groq",
+        await transcribeWithGroq(this.env, audioBase64)
+      );
+    }
+    return this.logTranscript("workers-ai", (output.text ?? "").trim());
+  }
+
+  private logTranscript(provider: string, text: string): string {
+    console.log(
+      JSON.stringify({ event: "transcribed", provider, chars: text.length })
+    );
+    return text;
+  }
+
+  /**
+   * A reply as speech: Aura-2 on Workers AI → base64 MP3. While the daily
+   * limit is in effect, it tells the browser to use its own voice instead.
+   */
+  @callable()
+  async speak(
+    text: string
+  ): Promise<{ audio: string } | { fallback: "browser" }> {
+    const spoken = toSpeechText(String(text ?? ""));
+    if (!spoken) return { fallback: "browser" };
+    if (this.dailyLimitActive()) return { fallback: "browser" };
+    try {
+      return { audio: await synthesizeWithAura(this.env.AI, spoken) };
+    } catch (error) {
+      if (isDailyLimitError(error)) {
+        this.recordDailyLimit(fallbackModel(this.env));
+      } else {
+        console.error(
+          JSON.stringify({ event: "tts_failed", error: String(error) })
+        );
+      }
+      return { fallback: "browser" };
+    }
+  }
+
+  /** Which voice backups the server has, so the mic can pick its mode. */
+  @callable()
+  getVoiceSetup(): { groq: boolean } {
+    return { groq: groqConfigured(this.env) };
   }
 
   // ── Memory reads and writes ──────────────────────────────────────────
@@ -405,6 +586,286 @@ export class JarvisAgent extends AIChatAgent<Env, JarvisState> {
     this.memoryChanged();
   }
 
+  // ── Integrations: APIs from OpenAPI specs, and MCP servers ───────────
+
+  private integrationsChanged() {
+    this.broadcast(JSON.stringify({ type: "integrations-changed" }));
+  }
+
+  private loadApis(): LoadedApi[] {
+    const rows = this
+      .sql<ApiSourceRow>`SELECT * FROM api_sources ORDER BY created_at, rowid`;
+    const loaded: LoadedApi[] = [];
+    for (const row of rows) {
+      let api = this.apiCache.get(row.id);
+      if (!api) {
+        try {
+          const converted = convertSpec(parseSpec(row.spec), {
+            maxTools: MAX_TOOLS_PER_API,
+            specUrl: row.spec_url ?? undefined
+          });
+          api = { row, tools: converted.tools, skipped: converted.skipped };
+          this.apiCache.set(row.id, api);
+        } catch (error) {
+          console.error(
+            JSON.stringify({
+              event: "api_spec_unreadable",
+              id: row.id,
+              error: String(error)
+            })
+          );
+          continue;
+        }
+      }
+      loaded.push(api);
+    }
+    return loaded;
+  }
+
+  /** Short, unique tool-name prefix from the API's name: "Open Meteo" → "open_meteo". */
+  private uniqueSlug(name: string): string {
+    const base =
+      name
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "_")
+        .replace(/^_+|_+$/g, "")
+        .slice(0, 16) || "api";
+    const taken = new Set(
+      this.sql<{ slug: string }>`SELECT slug FROM api_sources`.map(
+        (r) => r.slug
+      )
+    );
+    let slug = base;
+    for (let i = 2; taken.has(slug); i++) slug = `${base}${i}`;
+    return slug;
+  }
+
+  /** Convert an OpenAPI 3.x spec (pasted, or fetched from a URL) into tools. */
+  @callable()
+  async addApi(input: {
+    name: string;
+    specUrl?: string;
+    specText?: string;
+    baseUrl?: string;
+    authHeader?: string;
+    authValue?: string;
+  }) {
+    const name = String(input?.name ?? "").trim();
+    if (!name || name.length > 40) {
+      throw new Error("Give the API a short name (up to 40 characters).");
+    }
+    if (this.sql`SELECT id FROM api_sources`.length >= MAX_API_SOURCES) {
+      throw new Error(
+        `You can connect up to ${MAX_API_SOURCES} APIs. Remove one first.`
+      );
+    }
+
+    const specUrl = input.specUrl?.trim() || null;
+    let specText = String(input.specText ?? "").trim();
+    if (!specText) {
+      if (!specUrl) throw new Error("Paste a spec, or give the URL of one.");
+      requireHttps(specUrl, "The spec URL");
+      const response = await fetch(specUrl, {
+        signal: AbortSignal.timeout(10_000)
+      });
+      if (!response.ok) {
+        throw new Error(
+          `Couldn't download the spec (HTTP ${response.status}).`
+        );
+      }
+      specText = await response.text();
+    }
+    if (specText.length > MAX_SPEC_CHARS) {
+      throw new Error("That spec is too large (over 1 MB).");
+    }
+
+    const converted = convertSpec(parseSpec(specText), {
+      maxTools: MAX_TOOLS_PER_API,
+      specUrl: specUrl ?? undefined
+    });
+    if (converted.tools.length === 0) {
+      throw new Error("The spec has no operations Jarvis can call.");
+    }
+    const baseUrl = (input.baseUrl?.trim() || converted.baseUrl || "").replace(
+      /\/+$/,
+      ""
+    );
+    if (!baseUrl) {
+      throw new Error(
+        "This spec doesn't list a server URL. Enter the API's base URL."
+      );
+    }
+    requireHttps(baseUrl, "The base URL");
+
+    const authHeader = input.authHeader?.trim() || null;
+    const authValue = input.authValue?.trim() || null;
+    if (authHeader && !/^[A-Za-z0-9-]+$/.test(authHeader)) {
+      throw new Error(
+        "The auth header name can only use letters, digits and dashes."
+      );
+    }
+
+    const id = newId("a");
+    this.sql`INSERT INTO api_sources
+      (id, name, slug, base_url, spec, spec_url, auth_header, auth_value, created_at)
+      VALUES (${id}, ${name}, ${this.uniqueSlug(name)}, ${baseUrl}, ${specText},
+        ${specUrl}, ${authHeader}, ${authValue}, ${new Date().toISOString()})`;
+    this.integrationsChanged();
+    return {
+      id,
+      name,
+      baseUrl,
+      toolCount: converted.tools.length,
+      skipped: converted.skipped
+    };
+  }
+
+  @callable()
+  removeApi(id: string): boolean {
+    const found =
+      this.sql`SELECT id FROM api_sources WHERE id = ${String(id)}`.length > 0;
+    this.sql`DELETE FROM api_sources WHERE id = ${String(id)}`;
+    this.apiCache.delete(String(id));
+    if (found) this.integrationsChanged();
+    return found;
+  }
+
+  /** Connect an MCP server; the SDK saves it and reconnects after restarts. */
+  @callable()
+  async addMcp(input: {
+    name: string;
+    url: string;
+    authHeader?: string;
+    authValue?: string;
+  }) {
+    const name = String(input?.name ?? "").trim();
+    const url = String(input?.url ?? "").trim();
+    if (!name || name.length > 40) {
+      throw new Error("Give the server a short name (up to 40 characters).");
+    }
+    requireHttps(url, "The server URL");
+    if (Object.keys(this.getMcpServers().servers).length >= MAX_MCP_SERVERS) {
+      throw new Error(
+        `You can connect up to ${MAX_MCP_SERVERS} MCP servers. Remove one first.`
+      );
+    }
+    const authHeader = input.authHeader?.trim();
+    const authValue = input.authValue?.trim();
+    if (authHeader && !/^[A-Za-z0-9-]+$/.test(authHeader)) {
+      throw new Error(
+        "The auth header name can only use letters, digits and dashes."
+      );
+    }
+    const result = await this.addMcpServer(
+      name,
+      url,
+      authHeader && authValue
+        ? { transport: { headers: { [authHeader]: authValue } } }
+        : undefined
+    );
+    this.integrationsChanged();
+    return result;
+  }
+
+  @callable()
+  async removeMcp(id: string): Promise<boolean> {
+    await this.removeMcpServer(String(id));
+    this.integrationsChanged();
+    return true;
+  }
+
+  /** What's connected, for the Integrations panel. No secrets. */
+  @callable()
+  getIntegrations() {
+    const apis = this.loadApis().map(({ row, tools, skipped }) => ({
+      id: row.id,
+      name: row.name,
+      baseUrl: row.base_url,
+      hasAuth: Boolean(row.auth_value),
+      skipped,
+      tools: tools.map((t) => ({
+        name: `api_${row.slug}_${t.name}`,
+        method: t.method.toUpperCase(),
+        path: t.path,
+        readOnly: t.readOnly
+      }))
+    }));
+    const mcpState = this.getMcpServers();
+    const mcp = Object.entries(mcpState.servers).map(([id, server]) => ({
+      id,
+      name: server.name,
+      url: server.server_url,
+      state: server.state,
+      error: server.error ?? null,
+      authUrl: server.auth_url ?? null,
+      tools: mcpState.tools
+        .filter((t) => t.serverId === id)
+        .map((t) => ({
+          name: t.name,
+          readOnly: t.annotations?.readOnlyHint === true
+        }))
+    }));
+    return { apis, mcp, maxExternalTools: MAX_EXTERNAL_TOOLS };
+  }
+
+  /**
+   * Tools from connected APIs and MCP servers. Read-only calls (GET, or MCP
+   * tools annotated readOnlyHint) run directly; anything that might change
+   * data asks the user to approve first.
+   */
+  private externalTools(): { tools: ToolSet; tokens: number } {
+    const tools: ToolSet = {};
+    let tokens = 0;
+    const offer = (name: string, value: ToolSet[string], size: number) => {
+      if (Object.keys(tools).length >= MAX_EXTERNAL_TOOLS) return;
+      tools[name] = value;
+      tokens += size;
+    };
+
+    for (const { row, tools: apiTools } of this.loadApis()) {
+      const headers: Record<string, string> =
+        row.auth_header && row.auth_value
+          ? { [row.auth_header]: row.auth_value }
+          : {};
+      for (const op of apiTools) {
+        offer(
+          `api_${row.slug}_${op.name}`,
+          tool({
+            description: `${row.name}: ${op.description}`,
+            inputSchema: jsonSchema<Record<string, unknown>>(op.inputSchema),
+            needsApproval: !op.readOnly,
+            execute: async (args) =>
+              callOperation(op, args, { baseUrl: row.base_url, headers })
+          }),
+          estimateTokens({ d: op.description, s: op.inputSchema })
+        );
+      }
+    }
+
+    const catalog = new Map(
+      this.mcp
+        .listTools()
+        .map((t) => [`tool_${t.serverId.replace(/-/g, "")}_${t.name}`, t])
+    );
+    for (const [name, mcpTool] of Object.entries(this.mcp.getAITools())) {
+      const raw = catalog.get(name);
+      const execute = mcpTool.execute;
+      offer(
+        name,
+        {
+          ...mcpTool,
+          needsApproval: raw?.annotations?.readOnlyHint !== true,
+          execute: execute
+            ? async (args, options) =>
+                clipToolResult(await execute(args, options))
+            : undefined
+        },
+        estimateTokens({ d: raw?.description, s: raw?.inputSchema })
+      );
+    }
+    return { tools, tokens };
+  }
+
   // ── Chat ─────────────────────────────────────────────────────────────
 
   async onChatMessage(_onFinish: unknown, options?: OnChatMessageOptions) {
@@ -414,10 +875,11 @@ export class JarvisAgent extends AIChatAgent<Env, JarvisState> {
     const currentPrompt = async () =>
       buildSystemPrompt(await this.loadMemory(), this.state);
     const system = await currentPrompt();
-    // Fit the newest messages into the 24K context, without earlier turns'
-    // tool calls (see withoutOldToolCalls)
+    const external = this.externalTools();
+    // Fit the newest messages into the 24K context (after the connected
+    // tools' schemas), without earlier turns' tool calls (see withoutOldToolCalls)
     const messages = await convertToModelMessages(
-      withoutOldToolCalls(fitHistory(this.messages, system))
+      withoutOldToolCalls(fitHistory(this.messages, system, external.tokens))
     );
 
     // Used when the model's whole reply was talk about tools (see dropToolTalk)
@@ -456,6 +918,7 @@ export class JarvisAgent extends AIChatAgent<Env, JarvisState> {
         };
       },
       tools: {
+        ...external.tools,
         forget_fact: tool({
           description:
             "Delete a fact from long-term memory when the user asks you to forget it.",

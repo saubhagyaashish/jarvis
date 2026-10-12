@@ -5,6 +5,16 @@ import { getToolName, isToolUIPart, type UIMessage } from "ai";
 import type { JarvisAgent } from "./server";
 import type { JarvisState, Memory } from "./memory";
 import { MemoryPanel, type BriefingSchedule } from "./memory-panel";
+import { MicButton, type MicMode } from "./mic-button";
+import { browserRecognitionSupported, isServerVoiceFailure } from "./voice";
+import {
+  playMp3,
+  speakWithBrowser,
+  stopSpeaking,
+  unlockAudio
+} from "./speech-output";
+import { messageText, toSpeechText } from "./speech-text";
+import { IntegrationsPanel, type Integrations } from "./integrations-panel";
 import {
   Badge,
   Button,
@@ -20,6 +30,8 @@ import { Streamdown } from "streamdown";
 import { code } from "@streamdown/code";
 import {
   PaperPlaneRightIcon,
+  SpeakerHighIcon,
+  SpeakerSlashIcon,
   StopIcon,
   TrashIcon,
   GearIcon,
@@ -33,6 +45,7 @@ import {
   CaretDownIcon,
   BugIcon,
   WarningIcon,
+  PlugsConnectedIcon,
   XIcon
 } from "@phosphor-icons/react";
 
@@ -276,6 +289,18 @@ function DailyLimitBanner({
   );
 }
 
+const SPEAK_REPLIES_KEY = "jarvis-speak-replies";
+// After a server transcription failure, the browser listens for this long
+const BROWSER_VOICE_MS = 10 * 60_000;
+
+function readSpeakSetting(): boolean {
+  try {
+    return localStorage.getItem(SPEAK_REPLIES_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
 function notify(title: string, body: string) {
   if ("Notification" in window && Notification.permission === "granted") {
     new Notification(title, { body });
@@ -296,6 +321,16 @@ function Chat() {
   const [agentState, setAgentState] = useState<JarvisState | null>(null);
   const [briefingSchedule, setBriefingSchedule] =
     useState<BriefingSchedule | null>(null);
+  // Connected APIs and MCP servers; refetched when the agent reports a change
+  const [showIntegrations, setShowIntegrations] = useState(false);
+  const [integrations, setIntegrations] = useState<Integrations | null>(null);
+  const [integrationsVersion, setIntegrationsVersion] = useState(0);
+  // Voice: which server backups exist, and spoken replies
+  const [voiceSetup, setVoiceSetup] = useState<{ groq: boolean } | null>(null);
+  const [speakReplies, setSpeakReplies] = useState(readSpeakSetting);
+  const [speaking, setSpeaking] = useState(false);
+  const voiceTurn = useRef(false); // the text in the input came from the mic
+  const speakNext = useRef(false); // speak the reply to the message just sent
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const toasts = useKumoToastManager();
@@ -313,6 +348,8 @@ function Chat() {
       (state: JarvisState) => setAgentState(state),
       []
     ),
+    // MCP connection status changes (connecting → ready, failed, …)
+    onMcpUpdate: useCallback(() => setIntegrationsVersion((v) => v + 1), []),
     onMessage: useCallback(
       (message: MessageEvent) => {
         try {
@@ -320,6 +357,9 @@ function Chat() {
           if (data.type === "reminder") {
             toasts.add({ title: "Reminder", description: data.text });
             notify("Jarvis reminder", data.text);
+          }
+          if (data.type === "integrations-changed") {
+            setIntegrationsVersion((v) => v + 1);
           }
           if (data.type === "memory-changed") {
             setMemoryVersion((v) => v + 1);
@@ -359,6 +399,14 @@ function Chat() {
       .catch((e: unknown) => console.error("Failed to load memory:", e));
   }, [connected, memoryVersion]);
 
+  useEffect(() => {
+    if (!connected) return;
+    agentRef.current.stub
+      .getIntegrations()
+      .then(setIntegrations)
+      .catch((e: unknown) => console.error("Failed to load integrations:", e));
+  }, [connected, integrationsVersion]);
+
   const briefingScheduleId = agentState?.briefingScheduleId;
   useEffect(() => {
     if (!connected) return;
@@ -379,6 +427,8 @@ function Chat() {
     }
     seenBriefingAt.current = lastBriefingAt;
   }, [lastBriefingAt, toasts]);
+
+  const closeIntegrations = useCallback(() => setShowIntegrations(false), []);
 
   const callAgent = useCallback(
     (action: (stub: typeof agent.stub) => Promise<unknown>) => {
@@ -414,20 +464,138 @@ function Chat() {
     }
   }, [isStreaming]);
 
+  useEffect(() => {
+    if (!connected) return;
+    agentRef.current.stub
+      .getVoiceSetup()
+      .then(setVoiceSetup)
+      .catch((e: unknown) => console.error("Failed to load voice setup:", e));
+  }, [connected]);
+
   const sendText = useCallback(
-    (text: string) => {
+    (text: string, fromVoice = false) => {
       if (!text.trim() || isStreaming) return;
+      // Spoken messages get spoken replies; otherwise follow the toggle
+      speakNext.current = speakReplies || fromVoice;
+      stopSpeaking();
       sendMessage({
         role: "user",
         parts: [{ type: "text", text: text.trim() }]
       });
     },
-    [isStreaming, sendMessage]
+    [isStreaming, sendMessage, speakReplies]
+  );
+
+  // Aura-2 on Workers AI, or the browser's voice while the limit is in effect
+  const aiLimitUntil = agentState?.aiLimit?.until;
+  const speakReply = useCallback(
+    async (text: string) => {
+      const spoken = toSpeechText(text);
+      if (!spoken) return;
+      const limited = Boolean(
+        aiLimitUntil && Date.parse(aiLimitUntil) > Date.now()
+      );
+      setSpeaking(true);
+      try {
+        const result = limited
+          ? ({ fallback: "browser" } as const)
+          : await agentRef.current.stub.speak(text);
+        if ("audio" in result) await playMp3(result.audio);
+        else await speakWithBrowser(spoken);
+      } catch {
+        await speakWithBrowser(spoken).catch(() => {});
+      } finally {
+        setSpeaking(false);
+      }
+    },
+    [aiLimitUntil]
+  );
+
+  // When a reply finishes streaming, speak it if that was asked for
+  const previousStatus = useRef(status);
+  useEffect(() => {
+    const was = previousStatus.current;
+    previousStatus.current = status;
+    if (status !== "ready" || (was !== "streaming" && was !== "submitted")) {
+      return;
+    }
+    if (!speakNext.current) return;
+    speakNext.current = false;
+    const last = messages[messages.length - 1];
+    const text = last?.role === "assistant" ? messageText(last) : "";
+    if (text) void speakReply(text);
+  }, [status, messages, speakReply]);
+
+  const toggleSpeakReplies = useCallback(() => {
+    unlockAudio();
+    const next = !speakReplies;
+    setSpeakReplies(next);
+    if (!next) stopSpeaking();
+    try {
+      localStorage.setItem(SPEAK_REPLIES_KEY, next ? "1" : "0");
+    } catch {
+      // Not saved; the toggle still works for this visit
+    }
+  }, [speakReplies]);
+
+  const startListening = useCallback(() => {
+    stopSpeaking();
+    unlockAudio();
+  }, []);
+
+  // Voice: the transcript goes into the input box to check before sending
+  // If the server can't transcribe (Groq or Workers AI down), switch the mic
+  // to the browser's own recognition for a while. The clip can't be reused:
+  // the browser only recognizes live audio, so the user says it again.
+  const [browserVoiceUntil, setBrowserVoiceUntil] = useState(0);
+  useEffect(() => {
+    if (!browserVoiceUntil) return;
+    const timer = setTimeout(
+      () => setBrowserVoiceUntil(0),
+      Math.max(0, browserVoiceUntil - Date.now())
+    );
+    return () => clearTimeout(timer);
+  }, [browserVoiceUntil]);
+
+  const transcribe = useCallback(async (audioBase64: string) => {
+    try {
+      return await agentRef.current.stub.transcribe(audioBase64);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (isServerVoiceFailure(message) && browserRecognitionSupported()) {
+        setBrowserVoiceUntil(Date.now() + BROWSER_VOICE_MS);
+        console.warn(
+          "Server transcription failed; using the browser:",
+          message
+        );
+        throw new Error(
+          "Couldn't transcribe on the server, so the mic switched to your browser's speech recognition. Press the mic and say it again."
+        );
+      }
+      throw error;
+    }
+  }, []);
+  const insertTranscript = useCallback((text: string) => {
+    voiceTurn.current = true;
+    setInput((prev) => (prev.trim() ? `${prev.trimEnd()} ${text}` : text));
+    requestAnimationFrame(() => {
+      const el = textareaRef.current;
+      if (!el) return;
+      el.style.height = "auto";
+      el.style.height = `${el.scrollHeight}px`;
+      el.focus();
+    });
+  }, []);
+  const voiceError = useCallback(
+    (message: string) =>
+      toasts.add({ title: "Voice input", description: message }),
+    [toasts]
   );
 
   const send = useCallback(() => {
     if (!input.trim() || isStreaming) return;
-    sendText(input);
+    sendText(input, voiceTurn.current);
+    voiceTurn.current = false;
     setInput("");
     if (textareaRef.current) textareaRef.current.style.height = "auto";
   }, [input, isStreaming, sendText]);
@@ -436,6 +604,12 @@ function Chat() {
   const limit = agentState?.aiLimit;
   const dailyLimit =
     limit && Date.parse(limit.until) > Date.now() ? limit : null;
+  // While Workers AI is limited and there's no Groq key, the browser listens
+  const micMode: MicMode =
+    browserVoiceUntil > Date.now() ||
+    (dailyLimit && voiceSetup && !voiceSetup.groq)
+      ? "browser"
+      : "server";
 
   return (
     <div className="flex flex-col h-screen bg-kumo-elevated">
@@ -471,6 +645,52 @@ function Chat() {
                 aria-label="Toggle debug mode"
               />
             </div>
+            {speaking ? (
+              <Button
+                variant="secondary"
+                icon={<StopIcon size={16} />}
+                onClick={() => {
+                  stopSpeaking();
+                  setSpeaking(false);
+                }}
+                aria-label="Stop speaking"
+                title="Stop speaking"
+              />
+            ) : (
+              <Button
+                variant={speakReplies ? "primary" : "secondary"}
+                icon={
+                  speakReplies ? (
+                    <SpeakerHighIcon size={16} />
+                  ) : (
+                    <SpeakerSlashIcon size={16} />
+                  )
+                }
+                onClick={toggleSpeakReplies}
+                aria-label={
+                  speakReplies
+                    ? "Turn off spoken replies"
+                    : "Turn on spoken replies"
+                }
+                title={
+                  speakReplies ? "Spoken replies: on" : "Spoken replies: off"
+                }
+              />
+            )}
+            <Button
+              variant="secondary"
+              icon={<PlugsConnectedIcon size={16} />}
+              onClick={() => setShowIntegrations(true)}
+              aria-label="Integrations"
+            >
+              <span className="hidden sm:inline">Integrations</span>
+              {integrations &&
+                integrations.apis.length + integrations.mcp.length > 0 && (
+                  <Badge variant="primary" className="ml-1.5">
+                    {integrations.apis.length + integrations.mcp.length}
+                  </Badge>
+                )}
+            </Button>
             <ThemeToggle />
             <Button
               variant="secondary"
@@ -639,6 +859,20 @@ function Chat() {
               className="max-w-3xl mx-auto px-4 sm:px-5 py-4"
             >
               <div className="flex items-end gap-3 rounded-xl border border-kumo-line bg-kumo-base p-3 shadow-sm focus-within:ring-2 focus-within:ring-kumo-ring focus-within:border-transparent transition-shadow">
+                <MicButton
+                  mode={micMode}
+                  disabledReason={
+                    !connected
+                      ? "Not connected"
+                      : isStreaming
+                        ? "Wait for Jarvis to finish replying"
+                        : null
+                  }
+                  transcribe={transcribe}
+                  onTranscript={insertTranscript}
+                  onError={voiceError}
+                  onStart={startListening}
+                />
                 <InputArea
                   ref={textareaRef}
                   value={input}
@@ -724,6 +958,16 @@ function Chat() {
           />
         </aside>
       </div>
+
+      <IntegrationsPanel
+        open={showIntegrations}
+        onClose={closeIntegrations}
+        integrations={integrations}
+        onAddApi={(input) => agentRef.current.stub.addApi(input)}
+        onRemoveApi={(id) => agentRef.current.stub.removeApi(id)}
+        onAddMcp={(input) => agentRef.current.stub.addMcp(input)}
+        onRemoveMcp={(id) => agentRef.current.stub.removeMcp(id)}
+      />
     </div>
   );
 }
