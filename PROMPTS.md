@@ -13,11 +13,12 @@ I'd written the original design doc, `Jarvis — Architecture on Cloudflare.docx
 > brother I want you to go through the doc.
 
 > So I am doing this because for Cloudflare interview which is going to happen. this was the requirement-
-> *(pasted the assignment: LLM, workflow/coordination, chat or voice input, memory or state; prompt history required)*
+> _(pasted the assignment: LLM, workflow/coordination, chat or voice input, memory or state; prompt history required)_
 
 > yes go ahead, start with the doc fixes
 
 I wanted a second pair of eyes on the design before writing any code. The review caught things I'd missed:
+
 - Cron schedules run in UTC, so "08:00" would have fired at 1:30 pm IST.
 - Two separate paths could both write facts, which would create duplicates.
 - The design never said how the Workflow talks back to the agent.
@@ -28,7 +29,7 @@ I had those written into the doc before starting.
 
 > continue
 
-*(after I ran `npx wrangler login`)*
+_(after I ran `npx wrangler login`)_
 
 I started from Cloudflare's `agents-starter`, switched it to Llama 3.3 on Workers AI, and gave each browser its own agent instance, so visitors don't share a chat. The first local run showed every token doubled. Workers AI was streaming each chunk in two formats at once, and the provider library read both. We fixed it with a small wrapper around the AI binding and deployed.
 
@@ -53,10 +54,12 @@ Jarvis stores facts, tasks and notes in each user's own SQLite. Facts are extrac
 > /plan and lets go phase 2
 
 Decisions I made when asked:
+
 - **The briefing goes to both the chat and the side panel.** It's more noticeable as a message from Jarvis.
 - **No git yet.** I wanted to get the features in first. In hindsight, I'd start git earlier.
 
 The morning briefing is a durable Workflow (load context → compose → save), so a failed AI call retries one step instead of the whole run, and each run is visible in the dashboard. This phase surfaced the most interesting bugs:
+
 - **My test client never sent chat history**, so the earlier tests had passed too easily.
 - **Once history was real, Llama 3.3 started repeating tool calls**, adding the same task five times. We fixed it by rebuilding the prompt before every step, forcing a text answer after a successful tool call, and dropping old tool calls from the history.
 
@@ -76,9 +79,10 @@ Microphone → Whisper on Workers AI → the text lands in the input box so it c
 
 ## 8. Integrations: OpenAPI and MCP
 
-> I want add one more feature that if I give api spec an openai *[OpenAPI]* spec maybe it will can convert to mcp and can use it. I think there are already opensource code on github take an example and do the stuff. add this as an feature. also I can add any mcps urls that it can also use and do the stuff. could you help me out in this? it will save it. we can also delete manually.
+> I want add one more feature that if I give api spec an openai _[OpenAPI]_ spec maybe it will can convert to mcp and can use it. I think there are already opensource code on github take an example and do the stuff. add this as an feature. also I can add any mcps urls that it can also use and do the stuff. could you help me out in this? it will save it. we can also delete manually.
 
 Decisions I made when asked:
+
 - **Turn each OpenAPI operation into an MCP-style tool inside Jarvis**, following how open-source converters do it, rather than hosting a separate MCP server. It's simpler, and it avoids exposing an endpoint that carries my API keys.
 - **Approval only for calls that could change data.** Read-only calls (GET, or MCP tools marked read-only) run straight away. Writes ask first, so a malicious API response can't trick Jarvis into doing something.
 
@@ -92,7 +96,7 @@ The limits: 15 external tools in total, and large schemas trimmed, because Llama
 
 > 1. yes do it. 2. yeah sounds good 3. nope we not need this
 
-*(answering three questions: use Groq as the speech-to-text backup → yes; Aura-2 for spoken replies with the browser's voice as backup → yes; Hindi support → not needed)*
+_(answering three questions: use Groq as the speech-to-text backup → yes; Aura-2 for spoken replies with the browser's voice as backup → yes; Hindi support → not needed)_
 
 I wanted to understand the options before building. None of Ollama's models accept audio, so voice needed its own backups. I chose to keep a speech-to-text → Jarvis → text-to-speech pipeline instead of a speech-to-speech model, so memory and tools stay in Jarvis. Each direction runs Cloudflare first, then a free backup.
 
@@ -107,12 +111,13 @@ If server transcription fails, the mic switches to the browser's own recognition
 > cool I tested it. I didn't like the UI. I want some thing like a cartoon model/anime model speaking to me. changing expression. there should be two modes switch to voice or simple chat. and it will be having voice and chat history. the main will be the voice screen only. where I can talk. Few words what it will say like Hey Master welcome back. How you doing. I want the character facial changes also while speaking. If I need to speak the shortcut button will be holding ctrl+space button. or I will click on screen on record button something then stop. I want a cool UI. more like I am really talking to something.
 
 Decisions I made when asked:
+
 - **A 3D anime character (VRM)** rather than a 2D drawing. The characters are VRoid's sample models, released as CC0. I checked the licence inside each file before using them.
 - **Spoken messages are sent automatically**, so it feels like a conversation rather than a form.
 
 The character blinks, breathes, follows you with its eyes, changes expression while listening, thinking or speaking, and moves its mouth with the loudness of the reply audio.
 
-> Uncaught TypeError: l is not a function *(pasted the browser stack trace)* also the notification which is coming nothing it is telling it is only coming as a pop up
+> Uncaught TypeError: l is not a function _(pasted the browser stack trace)_ also the notification which is coming nothing it is telling it is only coming as a pop up
 
 The crash came from an effect that returned the result of `scrollIntoView()`, which newer Chrome versions return as a Promise; React then tried to call it as a cleanup function. I also wanted reminders spoken, not just shown, so Jarvis now announces them out loud.
 
@@ -123,6 +128,10 @@ The crash came from an effect that returned the result of `scrollIntoView()`, wh
 > do these steps in phase 4 - 6 -prompts md update this file remove rubbish questions and change it with good questions, design question tradeoffs etc and it should sound like human
 
 This is where this file was reorganised. The prompts stayed exactly as I typed them, and I replaced the long AI-written summaries with my own notes on what I decided.
+
+> proceed with phase 4. github init and commits are already done
+
+I'd set up the GitHub repo and commits myself. This step produced the README (with screenshots from a seeded demo), updated the design doc to match the final build, and ran a cleanup pass and the full set of smoke tests: chat, memory 10/10, briefing 14/14, voice 4/4, integrations 10/10.
 
 ---
 
@@ -145,6 +154,7 @@ This is where this file was reorganised. The prompts stayed exactly as I typed t
   - Aura-2 → the browser
 
   The free tier is small (two test runs use it up), so the app has to keep working when it runs out, and say so.
+
 - **Privacy over convenience in voice.** The browser's recognition is only a last resort, because Chrome sends that audio to Google.
 - **Cost-aware speech.** Aura-2 costs about 2,700 neurons per 1,000 characters, so spoken replies are capped at about 600 characters.
 - **A heavier page for a better experience.** Each character is a 15–19 MB download, but it only loads on the voice screen, so chat mode stays light.
